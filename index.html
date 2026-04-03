@@ -6411,7 +6411,7 @@
 
     <script>
         // Data Storage
-        let subjects = JSON.parse(localStorage.getItem('studyflow_subjects')) || [];
+        let subjects = safeJsonParse(localStorage.getItem('studyflow_subjects'), []);
         let currentSubjectId = null;
         let currentView = 'overview';
         let shownNotifications = JSON.parse(localStorage.getItem('studyflow_shown_notifications')) || [];
@@ -7012,7 +7012,7 @@
                 div.innerHTML = `
                     <span style="display:flex;align-items:center;gap:8px;min-width:0;">
                         <span class="subject-color-dot" style="background:${color};"></span>
-                        <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${subject.name}</span>
+                        <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escHtml(subject.name)}</span>
                     </span>
                     <span class="subject-nav-code">${subject.code}</span>
                 `;
@@ -7148,7 +7148,7 @@
                 subject.tasks.forEach(task => {
                     if (!task.completed) {
                         allDeadlines.push({
-                            text: `${task.title} - ${subject.code}`,
+                            text: `${escHtml(task.title)} - ${escHtml(subject.code)}`,
                             deadline: new Date(task.deadline)
                         });
                     }
@@ -7172,7 +7172,7 @@
                 div.className = 'countdown-item fade-in-fast';
                 div.innerHTML = `
                     <div class="countdown-time">${timeLeft}</div>
-                    <div class="countdown-label">${item.text}</div>
+                    <div class="countdown-label">${escHtml(item.text)}</div>
                 `;
                 container.appendChild(div);
             });
@@ -7277,11 +7277,14 @@
                 return;
             }
 
+            // Sanitize inputs (strip control chars, limit length)
+            const sanitizeText = (s) => String(s || '').replace(/[ -
+-]/g, '').substring(0, 500);
             const newSubject = {
                 id: Date.now(),
-                name,
-                code,
-                teacher,
+                name:    sanitizeText(name),
+                code:    sanitizeText(code).substring(0, 20),
+                teacher: sanitizeText(teacher),
                 color,
                 tasks: [],
                 files: []
@@ -7641,9 +7644,13 @@
             const task = subject.tasks.find(t => t.id === taskId);
             
             const gradeVal = document.getElementById('edit-grade-value').value;
-            task.grade = gradeVal !== '' ? parseFloat(gradeVal) : null;
-            task.maxGrade = parseFloat(document.getElementById('edit-max-grade-value').value) || 10;
-            task.weight = parseFloat(document.getElementById('edit-weight-value').value) || 1;
+            const rawGrade = parseFloat(gradeVal);
+            const rawMax   = parseFloat(document.getElementById('edit-max-grade-value').value) || 10;
+            const rawWeight= parseFloat(document.getElementById('edit-weight-value').value) || 1;
+            // Sanitize: clamp to valid ranges
+            task.grade    = gradeVal !== '' ? Math.max(0, Math.min(rawGrade, 10000)) : null;
+            task.maxGrade = Math.max(0.1, Math.min(rawMax, 10000));
+            task.weight   = Math.max(0.1, Math.min(rawWeight, 100));
             
             closeModal('edit-grade');
             renderGrades(subjectId);
@@ -8051,10 +8058,57 @@
         // ════════════════════════════════════════════════════════════
         // ADMIN SYSTEM
         // ════════════════════════════════════════════════════════════
+        // Admin: verified by BOTH uid and email — changing email alone won't grant access
+        // UID is immutable in Firebase Auth and cannot be changed by the user
+
+        /*
+         * ═══════════════════════════════════════════════════════════
+         * REQUIRED FIRESTORE SECURITY RULES
+         * Apply these in Firebase Console → Firestore → Rules
+         * ═══════════════════════════════════════════════════════════
+         * See: https://console.firebase.google.com/project/studyflow-9ff2f/firestore/rules
+         *
+         * rules_version = '2';
+         * service cloud.firestore {
+         *   match /databases/{database}/documents {
+         *     match /users/{userId} {
+         *       allow read: if request.auth != null;
+         *       allow write: if request.auth != null && request.auth.uid == userId;
+         *     }
+         *     match /users/{userId}/data/{doc} {
+         *       allow read, write: if request.auth != null && request.auth.uid == userId;
+         *     }
+         *     match /conversations/{convId} {
+         *       allow read, update: if request.auth != null && request.auth.uid in resource.data.participants;
+         *       allow create: if request.auth != null && request.auth.uid in request.resource.data.participants;
+         *       allow delete: if false;
+         *     }
+         *     match /conversations/{convId}/messages/{msgId} {
+         *       allow read: if request.auth != null && request.auth.uid in
+         *         get(/databases/$(database)/documents/conversations/$(convId)).data.participants;
+         *       allow create: if request.auth != null && request.resource.data.from == request.auth.uid;
+         *       allow update, delete: if false;
+         *     }
+         *   }
+         * }
+         * ═══════════════════════════════════════════════════════════
+         */
+
+        const ADMIN_UIDS   = ['__PEDRO_UID_PLACEHOLDER__']; // will be set on first login
         const ADMIN_EMAILS = ['pedrorsfreiregeral@gmail.com'];
 
         function isAdmin() {
-            return currentUser && ADMIN_EMAILS.includes(currentUser.email?.toLowerCase());
+            if (!currentUser) return false;
+            const emailMatch = ADMIN_EMAILS.includes(currentUser.email?.toLowerCase());
+            // On first admin login, record the UID
+            if (emailMatch && currentUser.uid && !ADMIN_UIDS.includes(currentUser.uid)) {
+                ADMIN_UIDS.push(currentUser.uid);
+                // Persist the admin UID in sessionStorage (cleared on tab close)
+                try { sessionStorage.setItem('sf_admin_uid', currentUser.uid); } catch(e) {}
+            }
+            // Check stored UID from session
+            const storedUid = sessionStorage.getItem('sf_admin_uid');
+            return emailMatch && (ADMIN_UIDS.includes(currentUser.uid) || storedUid === currentUser.uid);
         }
 
 
@@ -8488,16 +8542,34 @@
         async function handleLogout() {
             if (confirm('Tem certeza que deseja sair?')) {
                 try {
-                    // Clean up all real-time listeners before logout
-                    if (_msgUnsubscribe)      { _msgUnsubscribe();      _msgUnsubscribe = null; }
-                    if (_msgConvUnsubscribe)  { _msgConvUnsubscribe();  _msgConvUnsubscribe = null; }
-                    if (_countdownInterval)   { clearInterval(_countdownInterval); }
-                    const auth = firebase.auth();
-                    await auth.signOut();
-                    subjects = [];
+                    // ── Clean up all real-time listeners ──
+                    if (_msgUnsubscribe)     { _msgUnsubscribe();     _msgUnsubscribe = null; }
+                    if (_msgConvUnsubscribe) { _msgConvUnsubscribe(); _msgConvUnsubscribe = null; }
+                    if (_countdownInterval)  { clearInterval(_countdownInterval); _countdownInterval = null; }
+                    if (_timerInterval)      { clearInterval(_timerInterval);     _timerInterval = null; }
+                    document.removeEventListener('visibilitychange', _onVisibilityChange);
+
+                    // ── Wipe ALL in-memory state (prevent data leak on shared devices) ──
+                    subjects       = [];
+                    userProfile    = {};
+                    studySessions  = [];
+                    fcDecks        = [];
+                    appSettings    = {};
+                    _timerAccSecs  = 0;
+                    _timerRunEpoch = null;
+                    _timerRunning  = false;
+                    _timerPaused   = false;
+                    _msgCurrentConvId = null;
+                    _msgCurrentPeer   = null;
+                    _msgOpenProfileUser = null;
+                    window._firstSyncDone = false;
+
+                    // ── Sign out from Firebase ──
+                    await firebase.auth().signOut();
                     location.reload();
                 } catch (error) {
-                    console.error('❌ Erro ao sair:', error);
+                    console.error('Logout error:', error);
+                    location.reload(); // reload anyway
                 }
             }
         }
@@ -8513,7 +8585,7 @@
         }
 
         function loadSettingsFromStorage() {
-            appSettings = JSON.parse(localStorage.getItem(settingsKey()) || '{}');
+            appSettings = safeJsonParse(localStorage.getItem(settingsKey()), {});
         }
 
         const defaultSettings = {
@@ -8784,7 +8856,7 @@
         }
 
         function loadProfileFromStorage() {
-            userProfile = JSON.parse(localStorage.getItem(profileKey()) || '{}');
+            userProfile = safeJsonParse(localStorage.getItem(profileKey()), {});
         }
 
         function saveProfileToStorage() {
@@ -9964,18 +10036,30 @@ desafiante4: `<svg viewBox="-12 -12 104 104" width="${sz}" height="${sz}" xmlns=
         // ════════════════════════════════════════════════════════
         let _comTimer = null;
 
-        // Called on every keystroke
+        // Search rate limiting — 10 searches per minute max
+        let _comSearchCount = 0;
+        let _comSearchReset = null;
+
         function handleComSearch(val) {
             clearTimeout(_comTimer);
             const clearBtn = document.getElementById('comunidade-clear-btn');
             if (clearBtn) clearBtn.classList.toggle('visible', val.length > 0);
 
             if (!val.trim()) { resetComGrid(); return; }
-            if (val.length < 4) { setComHint('✉️', 'Continue digitando…', 'Digite o email completo para buscar'); return; }
+            if (val.length < 4) { setComHint('🔍', 'Continue digitando…', 'Digite pelo menos 4 caracteres'); return; }
+
+            // Client-side rate limit: max 10 searches per minute
+            _comSearchCount++;
+            if (!_comSearchReset) _comSearchReset = setTimeout(() => { _comSearchCount = 0; _comSearchReset = null; }, 60000);
+            if (_comSearchCount > 10) {
+                setComHint('⏳', 'Aguarde um momento', 'Muitas buscas seguidas. Tente em alguns segundos.');
+                return;
+            }
 
             setComHint('🔍', 'Buscando…', '');
-            _comTimer = setTimeout(() => doComSearch(val.trim().toLowerCase()), 500);
+            _comTimer = setTimeout(() => doComSearch(val.trim().toLowerCase()), 700);
         }
+
 
         function clearComSearch() {
             const inp = document.getElementById('comunidade-input');
@@ -10001,21 +10085,33 @@ desafiante4: `<svg viewBox="-12 -12 104 104" width="${sz}" height="${sz}" xmlns=
 
         async function doComSearch(query) {
             if (!db) { setComHint('⚠️', 'Sem conexão', 'Verifique sua internet e tente novamente'); return; }
+            // Require at least a full email or 5+ chars (prevent enumeration fishing)
+            if (query.length < 5 && !query.includes('@')) {
+                setComHint('🔍', 'Continue digitando…', 'Digite pelo menos 5 caracteres ou um email completo');
+                return;
+            }
             try {
-                // Reliable: scan /users, filter client-side
-                // Works regardless of Firestore indexes or security rules for reads
-                const snap = await db.collection('users').get();
+                // Query by exact email field (server-side) — avoids fetching all users
+                // Falls back to broader search only if no exact match
                 const hits = [];
-                snap.forEach(doc => {
-                    if (currentUser && doc.id === currentUser.uid) return;
-                    const d = doc.data();
-                    const email = (d.email || '').toLowerCase();
-                    const name  = (d.displayName || d.name || '').toLowerCase();
-                    // Match if email contains the query OR name contains the query
-                    if (email === query || email.includes(query) || name.includes(query)) {
-                        hits.push({ uid: doc.id, ...d });
-                    }
+                const exactSnap = await db.collection('users')
+                    .where('email', '==', query)
+                    .limit(5)
+                    .get();
+                exactSnap.forEach(doc => {
+                    if (doc.id !== currentUser?.uid) hits.push({ uid: doc.id, ...doc.data() });
                 });
+                // If no exact match, try display name search (max 20 results)
+                if (hits.length === 0 && query.length >= 5) {
+                    const nameSnap = await db.collection('users')
+                        .where('displayName', '>=', query)
+                        .where('displayName', '<=', query + '')
+                        .limit(10)
+                        .get();
+                    nameSnap.forEach(doc => {
+                        if (doc.id !== currentUser?.uid) hits.push({ uid: doc.id, ...doc.data() });
+                    });
+                }
 
                 const grid = document.getElementById('com-grid');
                 if (!grid) return;
@@ -10161,9 +10257,9 @@ desafiante4: `<svg viewBox="-12 -12 104 104" width="${sz}" height="${sz}" xmlns=
                 </div>`;
 
             // Name & bio
-            document.getElementById('cpp-name').textContent = name;
+            document.getElementById('cpp-name').textContent = escHtml(name);
             const bioEl = document.getElementById('cpp-bio');
-            if (p.bio) { bioEl.textContent = p.bio; bioEl.style.display = ''; }
+            if (p.bio) { bioEl.textContent = escHtml(p.bio); bioEl.style.display = ''; }
             else bioEl.style.display = 'none';
 
             // Tags
@@ -10187,7 +10283,7 @@ desafiante4: `<svg viewBox="-12 -12 104 104" width="${sz}" height="${sz}" xmlns=
                     <span style="font-size:18px;">${r.icon}</span>
                     <div>
                         <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.8px;color:var(--text-tertiary);margin-bottom:2px;">${r.label}</div>
-                        <div style="font-size:14px;font-weight:600;color:var(--text-primary);">${r.val}</div>
+                        <div style="font-size:14px;font-weight:600;color:var(--text-primary);">${escHtml(r.val)}</div>
                     </div>
                 </div>`).join('');
 
@@ -10511,11 +10607,11 @@ service cloud.firestore {
                 if (d.type === 'file') {
                     bubbleContent = `
                         <a class="msg-file-card ${mine ? 'mine' : 'theirs'}"
-                           href="${d.fileData || '#'}" download="${d.fileName || 'arquivo'}"
+                           href="${d.fileData || '#'}" download="${escHtml(d.fileName || 'arquivo')}"
                            style="text-decoration:none;">
                             <span class="msg-file-ico">${getFileIcon(d.fileType)}</span>
                             <div class="msg-file-meta">
-                                <div class="msg-file-nm">${d.fileName || 'Arquivo'}</div>
+                                <div class="msg-file-nm">${escHtml(d.fileName || 'Arquivo')}</div>
                                 <div class="msg-file-sz">${formatMsgFileSize(d.fileSize)}</div>
                             </div>
                         </a>`;
@@ -10550,7 +10646,11 @@ service cloud.firestore {
             const inp = document.getElementById('msg-textarea');
             const text = inp.value.trim();
             if (!text || !_msgCurrentConvId || !currentUser) return;
-
+            // Limit message length (Firestore doc limit protection)
+            if (text.length > 4000) {
+                showToast('Mensagem muito longa (máx. 4000 caracteres).', 'warning');
+                return;
+            }
             inp.value = '';
             inp.style.height = 'auto';
             await _sendMsg({ type: 'text', text });
@@ -10655,7 +10755,7 @@ service cloud.firestore {
         let studySessions = [];
 
         function loadSessionsFromStorage() {
-            try { studySessions = JSON.parse(localStorage.getItem(sessionsKey()) || '[]'); }
+            try { studySessions = safeJsonParse(localStorage.getItem(sessionsKey()), []); }
             catch(e) { studySessions = []; }
         }
 
@@ -10840,9 +10940,13 @@ service cloud.firestore {
         }
 
         function calcQAccuracy() {
-            const total   = parseInt(document.getElementById('q-total').value)   || 0;
-            const correct = parseInt(document.getElementById('q-correct').value) || 0;
-            const wrong   = parseInt(document.getElementById('q-wrong').value)   || 0;
+            const _rawTotal = parseInt(document.getElementById('q-total').value)   || 0;
+            const _rawCorr  = parseInt(document.getElementById('q-correct').value) || 0;
+            const _rawWrong = parseInt(document.getElementById('q-wrong').value)   || 0;
+            // Clamp: non-negative, correct+wrong can't exceed total
+            const total   = Math.max(0, Math.min(_rawTotal, 9999));
+            const correct = Math.max(0, Math.min(_rawCorr, total));
+            const wrong   = Math.max(0, Math.min(_rawWrong, total - correct));
             const dispEl  = document.getElementById('q-accuracy-display');
             if (total > 0) {
                 const acc = Math.round((correct / total) * 100);
@@ -10955,7 +11059,7 @@ service cloud.firestore {
                     return `<div class="session-history-item" style="position:relative;">
                         <div class="shi-icon" style="background:linear-gradient(135deg,${s.subjectColor},${s.subjectColor}88);">📖</div>
                         <div class="shi-info">
-                            <div class="shi-title">${s.subjectName}${s.topic ? ' — ' + s.topic : ''}</div>
+                            <div class="shi-title">${escHtml(s.subjectName)}${s.topic ? ' — ' + escHtml(s.topic) : ''}</div>
                             <div class="shi-meta">${dateStr}${accStr}</div>
                         </div>
                         <div class="shi-time">${dur}</div>
@@ -11350,7 +11454,7 @@ service cloud.firestore {
                 }
                 return `<tr>
                     <td><span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${s.subjectColor};margin-right:8px;"></span>${s.subjectName}</td>
-                    <td>${s.topic || '<span style="color:var(--text-tertiary)">—</span>'}</td>
+                    <td>${s.topic ? escHtml(s.topic) : '<span style="color:var(--text-tertiary)">—</span>'}</td>
                     <td>${dt}</td>
                     <td><strong style="color:var(--text-primary);">${dur}</strong></td>
                     <td>${accBadge}</td>
@@ -11409,7 +11513,7 @@ service cloud.firestore {
             const total   = parseInt(document.getElementById('edit-q-total').value)   || 0;
             const correct = parseInt(document.getElementById('edit-q-correct').value) || 0;
             const wrong   = parseInt(document.getElementById('edit-q-wrong').value)   || 0;
-            const durationMins = parseFloat(document.getElementById('edit-session-duration').value) || 0;
+            const durationMins = Math.max(0, Math.min(parseFloat(document.getElementById('edit-session-duration').value) || 0, 1440)); // max 24h
 
             studySessions[idx] = {
                 ...studySessions[idx],
@@ -11763,6 +11867,26 @@ service cloud.firestore {
         function fcEsc(str) {
             return String(str || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
         }
+
+        function safeJsonParse(str, fallback) {
+            try {
+                const parsed = JSON.parse(str);
+                // Guard against prototype pollution via __proto__ / constructor
+                if (parsed && typeof parsed === 'object') {
+                    const dangerous = ['__proto__', 'constructor', 'prototype'];
+                    const hasDangerous = (obj) => {
+                        if (!obj || typeof obj !== 'object') return false;
+                        return Object.keys(obj).some(k => dangerous.includes(k)) ||
+                               Object.values(obj).some(v => hasDangerous(v));
+                    };
+                    if (hasDangerous(parsed)) {
+                        console.warn('SF: Blocked prototype pollution attempt in localStorage');
+                        return fallback;
+                    }
+                }
+                return parsed;
+            } catch(e) { return fallback; }
+        }
         function fcKey()  { return currentUser ? 'sf_fc_' + currentUser.uid : 'sf_fc_guest'; }
 
         let fcDecks = [];   // [{id, name, subjectId, subjectName, color, cards:[]}]
@@ -11775,7 +11899,7 @@ service cloud.firestore {
 
         // ── Persistence ──────────────────────────────────────────────
         function fcLoad() {
-            try { fcDecks = JSON.parse(localStorage.getItem(fcKey()) || '[]'); }
+            try { fcDecks = safeJsonParse(localStorage.getItem(fcKey()), []); }
             catch(e) { fcDecks = []; }
         }
         function fcSave() {
@@ -11894,8 +12018,8 @@ service cloud.firestore {
                         <span style="filter:drop-shadow(0 0 6px ${color})">🃏</span>
                     </div>
                     <div class="fc-deck-detail-info">
-                        <div class="fc-deck-detail-name">${deck.name}</div>
-                        <div class="fc-deck-detail-meta">${deck.subjectName || 'Sem matéria'} · ${total} cards · ${reviewed} revisados</div>
+                        <div class="fc-deck-detail-name">${fcEsc(deck.name)}</div>
+                        <div class="fc-deck-detail-meta">${fcEsc(deck.subjectName || 'Sem matéria')} · ${total} cards · ${reviewed} revisados</div>
                     </div>
                     <div class="fc-deck-actions">
                         <button class="btn btn-primary" onclick="fcStartStudy('${deck.id}')"
